@@ -2,11 +2,12 @@
 
 **平台**：Lidar300 蜂群无人机
 **撰写日期**：2026-10-02
-**文档版本**：v2.0
+**文档版本**：v3.0
 
 > **变更记录**
 > - v1.0：系统总览与五大硬件模块组成、接口与参数。
 > - v2.0：新增第 8 章动力系统性能计算（推力/功率/悬停时间）、第 9 章电源链路分析与供电校验。
+> - v3.0：新增第 10 章通信链路带宽与延迟量化分析、第 11 章可靠性设计（链路冗余、失效降级、EMC），并给出第 12 章设计结论。
 
 ---
 
@@ -219,3 +220,168 @@ $$
 $$
 
 从而实现动力与感知的电源域隔离，避免点云与图像在低电压/高噪声条件下出现异常。
+
+---
+
+## 10. 通信链路带宽与延迟量化分析
+
+### 10.1 链路清单与速率
+
+| 链路 | 物理接口 | 协议 | 典型速率 | 数据特征 |
+|------|----------|------|----------|----------|
+| Mid360 → Orin NX | 以太网 | Livox SDK / UDP | 100/1000 Mbps | 点云，约 200,000 点/秒 |
+| RGB-90 → Orin NX | USB 3.0 | UVC | ≤ 5 Gbps | 1080p@30fps 未压缩约 1.5 Gbps，实际 MJPEG 压缩后 15~50 Mbps |
+| RGB-120 → Orin NX | USB 3.0 | UVC | ≤ 5 Gbps | 同上 |
+| 光流 → PX4 | UART | MAVLink | 115200 bps | 小包、高频（50~100 Hz） |
+| Orin NX ↔ PX4 | UART | MAVLink | 921600 bps | 中小包、双向 |
+| PX4 → 电调 | 单线数字 | DShot600 | 600 kbit/s | 16 bit/帧，确定性延迟 |
+| 接收机 → PX4 | 反相串口 | SBUS | 100 kbit/s | 25 字节/帧，7 ms 周期 |
+
+### 10.2 总线占用率计算
+
+UART 链路上单帧传输时间为
+
+$$
+t_{\text{frame}} = \frac{N_{\text{bit}}}{B}
+$$
+
+其中 $N_{\text{bit}}$ 为一帧总位数（含起始位、停止位），$B$ 为波特率。以 MAVLink `ATTITUDE` 消息（28 字节载荷 + 8 字节帧头 + 2 字节校验 = 38 字节）为例，UART 8N1 下每字节 10 bit：
+
+$$
+N_{\text{bit}} = 38 \times 10 = 380\,\text{bit}
+$$
+
+在 $B = 921600\,\mathrm{bps}$ 下：
+
+$$
+t_{\text{frame}} = \frac{380}{921600} \approx 0.41\,\mathrm{ms}
+$$
+
+若姿态消息以 $f = 100\,\mathrm{Hz}$ 下发，则总线占用率为
+
+$$
+\eta_{\text{bus}} = t_{\text{frame}} \cdot f = 0.41 \times 10^{-3} \times 100 = 4.1\%
+$$
+
+说明 921600 bps 下 MAVLink 上行/下行仍有充裕余量，可同时承载里程计、目标点、心跳等多条消息流。
+
+### 10.3 DShot600 时序分析
+
+DShot 每帧 16 bit（11 bit 油门 + 1 bit 遥测请求 + 4 bit CRC），位周期为
+
+$$
+T_{\text{bit}} = \frac{1}{600 \times 10^3} \approx 1.67\,\mu\mathrm{s}
+$$
+
+整帧时长
+
+$$
+T_{\text{frame}} = 16 \times T_{\text{bit}} \approx 26.7\,\mu\mathrm{s}
+$$
+
+若飞控控制环以 $f_{\text{ctrl}} = 400\,\mathrm{Hz}$ 运行，则每个控制周期有
+
+$$
+\frac{1}{f_{\text{ctrl}}} = 2.5\,\mathrm{ms} \gg 26.7\,\mu\mathrm{s}
+$$
+
+即电调指令延迟占控制周期比例不足 $1.1\%$，相比传统 PWM（1000~2000 μs 脉宽，周期 2.5 ms）具有明显实时性优势，且数字编码避免了模拟脉宽的温漂与抖动。
+
+### 10.4 端到端延迟预算
+
+从传感器采样到执行器响应的端到端延迟可分解为
+
+$$
+\tau_{\text{total}} = \tau_{\text{sense}} + \tau_{\text{trans}} + \tau_{\text{compute}} + \tau_{\text{cmd}} + \tau_{\text{act}}
+$$
+
+各项典型值：
+
+| 环节 | 符号 | 典型值 |
+|------|------|--------|
+| 传感器采样与曝光 | $\tau_{\text{sense}}$ | 5~10 ms |
+| 数据传输 | $\tau_{\text{trans}}$ | 1~3 ms（以太网/USB） |
+| 机载电脑感知与规划 | $\tau_{\text{compute}}$ | 20~50 ms |
+| MAVLink 指令下发 | $\tau_{\text{cmd}}$ | 0.4~2 ms |
+| 飞控控制环与电调响应 | $\tau_{\text{act}}$ | 2.5~5 ms |
+
+合计
+
+$$
+\tau_{\text{total}} \approx 29 \sim 70\,\mathrm{ms}
+$$
+
+该量级对 1~3 m/s 飞行速度下的避障任务可接受（对应位移 3~21 cm），但需要在规划层引入状态外推补偿：
+
+$$
+\hat{\boldsymbol{p}}(t + \tau) = \boldsymbol{p}(t) + \boldsymbol{v}(t)\tau + \frac{1}{2}\boldsymbol{a}(t)\tau^2
+$$
+
+以抵消延迟带来的位姿滞后。
+
+## 11. 可靠性设计
+
+### 11.1 控制链路冗余
+
+飞控同时接收两路指令源，按优先级仲裁：
+
+$$
+\boldsymbol{u}_{\text{out}} = 
+\begin{cases}
+\boldsymbol{u}_{\text{RC}}, & \text{手动模式或 RC 触发} \
+\boldsymbol{u}_{\text{companion}}, & \text{自动模式且链路健康} \
+\boldsymbol{u}_{\text{failsafe}}, & \text{链路超时}
+\end{cases}
+$$
+
+其中链路健康判据为心跳超时
+
+$$
+t_{\text{now}} - t_{\text{last\_heartbeat}} > \tau_{\text{timeout}}
+$$
+
+典型取 $\tau_{\text{timeout}} = 2\,\mathrm{s}$，超时后触发失效保护。
+
+### 11.2 传感器冗余
+
+惯导（飞控 IMU）与光流/激光雷达里程计构成互补：IMU 高频但存在漂移，外部里程计低频但无累积误差。二者的误差特性为
+
+$$
+\sigma_{\text{IMU}}(t) \propto \sqrt{t}, \qquad \sigma_{\text{odom}}(t) \approx \text{const}
+$$
+
+通过 EKF 融合可使长期位姿误差收敛到外部里程计量级，避免纯 IMU 积分发散。
+
+### 11.3 电磁兼容（EMC）
+
+- 电调输出到电机的三相大电流回路与信号线**分层走线**，避免平行长距离布线；
+- 电感耦合干扰电压满足
+
+$$
+U_{\text{ind}} = M \cdot \frac{\mathrm{d}i}{\mathrm{d}t}
+$$
+
+  通过减小互感 $M$（拉开间距、双绞、垂直交叉）抑制；
+- GNSS/接收机天线远离电调与电源线，2.4 GHz 接收机链路保留 $20\,\mathrm{dB}$ 以上链路余量：
+
+$$
+\text{Margin} = P_{\text{rx}} - P_{\text{sensitivity}}
+$$
+
+### 11.4 电源失效保护
+
+电池电压低于阈值时触发分级保护：
+
+$$
+U_{\text{cell}} < U_{\text{warn}} \Rightarrow \text{告警}; \qquad U_{\text{cell}} < U_{\text{crit}} \Rightarrow \text{强制返航/降落}
+$$
+
+6s 电池对应 $U_{\text{warn}} \approx 3.5\,\mathrm{V/cell}$（21 V）、$U_{\text{crit}} \approx 3.3\,\mathrm{V/cell}$（19.8 V）。
+
+## 12. 设计结论
+
+1. **带宽分层合理**：点云/图像走以太网与 USB，控制与状态走 UART/MAVLink，实时执行走 DShot600，各链路占用率均留有 2 倍以上余量。
+2. **实时性满足**：端到端延迟 $29\sim70\,\mathrm{ms}$，配合状态外推可满足中低速自主飞行需求。
+3. **动力余量充足**：悬停母线电流约 18.6 A，电调 50 A 额定值留有 2.7 倍峰值余量；续航约 11~12 min，可通过提高电池容量或降低起飞质量改善。
+4. **电源与 EMC 设计到位**：12 V/24 V 双轨隔离、去耦与分层布线有效隔离动力噪声。
+5. **改进方向**：若后续需更高算力或更长续航，建议评估 6s2p 电池方案与 8 英寸桨低转速效率区间。
